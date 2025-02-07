@@ -21,15 +21,21 @@ def process_file_v2(cloudevent: CloudEvent):
     """
     # Extract and decode the Pub/Sub message data
     data = cloudevent.data
+    print(f"Received cloudevent data: {data}")
+    
     if isinstance(data, dict):
         message = data
     else:
         message = json.loads(data)
+    
+    print(f"Decoded message: {message}")
 
     file_id = message.get("fileId")
     file_name = message.get("fileName")
     bucket_name = message.get("bucket")
     config_doc_path = message.get("configDocumentPath")
+
+    print(f"fileId: {file_id}, fileName: {file_name}, bucket: {bucket_name}, configDocumentPath: {config_doc_path}")
 
     if not all([file_id, file_name, bucket_name, config_doc_path]):
         print("Missing one or more required fields in the message.")
