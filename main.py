@@ -52,7 +52,7 @@ def process_file_v2(cloudevent: CloudEvent):
 
     # Download the file from GCS
     bucket = storage_client.bucket(bucket_name)
-    blob = bucket.blob(file_name)
+    blob = bucket.blob(os.path.join('uploads', file_name))
     file_content = blob.download_as_text()
 
     # Process the CSV content
