@@ -23,10 +23,7 @@ def process_file_v2(cloudevent: CloudEvent):
     data = cloudevent.data
     print(f"Received cloudevent data: {data}")
     
-    if isinstance(data, dict):
-        message = data
-    else:
-        message = json.loads(data)
+    message = json.loads(data)
     
     print(f"Decoded message: {message}")
 
