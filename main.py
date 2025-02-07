@@ -2,6 +2,7 @@ import os
 import json
 import io
 import csv
+import base64
 import zipfile
 import requests
 import functions_framework
@@ -20,12 +21,8 @@ def process_file_v2(cloudevent: CloudEvent):
       - configDocumentPath  (e.g., "scrubFilesConfig/<docID>")
     """
     # Extract and decode the Pub/Sub message data
-    data = cloudevent.data
-    print(f"Received cloudevent data: {data}")
-    
+    data = base64.b64decode(cloudevent.data['message']['data']).decode('utf-8')
     message = json.loads(data)
-    
-    print(f"Decoded message: {message}")
 
     file_id = message.get("fileId")
     file_name = message.get("fileName")
