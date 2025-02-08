@@ -47,7 +47,7 @@ def process_file_v2(cloudevent: CloudEvent):
         return
     config = config_snapshot.to_dict()
 
-    phone_columns = config.get("phoneColumns", [])
+    phone_columns = config.get("phoneColumnIndexes", [])
     has_header = config.get("hasHeaderRow", False)
 
     # Download the file from GCS
