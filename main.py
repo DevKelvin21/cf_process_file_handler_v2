@@ -79,6 +79,13 @@ def process_file_v2(cloudevent: CloudEvent):
         writer.writerow(row)
     csv_payload = output_buffer.getvalue()
 
+    config_ref.update({
+        "status": {
+            "stage": "PREPARED",
+            "lastUpdated": firestore.SERVER_TIMESTAMP
+            }
+    })
+
     # Call the Blacklist API with the CSV payload
     blacklist_api_url = "https://api.blacklistalliance.net/bulk/upload"
     file_tuple = (
@@ -106,6 +113,13 @@ def process_file_v2(cloudevent: CloudEvent):
         print(f"Blacklist API call failed: {response.status_code} - {response.text}")
         return
 
+    config_ref.update({
+        "status": {
+            "stage": "API_CALLED",
+            "lastUpdated": firestore.SERVER_TIMESTAMP
+            }
+    })
+
     # Process the returned ZIP file from the API
     zip_bytes = response.content
     results = {}
@@ -127,16 +141,19 @@ def process_file_v2(cloudevent: CloudEvent):
         output_blob_name = f"{file_id}/{file_name}_{result_filename}"
         out_blob = output_bucket.blob(output_blob_name)
         out_blob.upload_from_string(content, content_type="text/csv")
-        output_paths[result_filename] = f"gs://{output_bucket_name}/{file_id}/{file_name}_{result_filename}"
+        output_paths[result_filename] = f"{file_id}/{file_name}_{result_filename}"
 
     # Update the Firestore document with output file paths and processing status
     config_ref.update({
         "outputFiles": {
-            "cleanFilePath": output_paths.get(f"{file_name}_all_clean.csv", ""),
-            "invalidFilePath": output_paths.get(f"{file_name}_invalid.csv", ""),
-            "dncFilePath": output_paths.get(f"{file_name}_federal_dnc.csv", "")
+            "cleanFilePath": output_paths.get("all_clean.csv", ""),
+            "invalidFilePath": output_paths.get("invalid.csv", ""),
+            "dncFilePath": output_paths.get("federal_dnc.csv", "")
         },
-        "status": {"stage": "DONE"}
+        "status": {
+            "stage": "DONE",
+            "lastUpdated": firestore.SERVER_TIMESTAMP
+            }
     })
 
     print(f"Processed file_id={file_id}. Output files uploaded: {output_paths}")
