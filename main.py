@@ -69,7 +69,7 @@ def process_file_v2(cloudevent: CloudEvent):
         for col_idx in phone_columns:
             if col_idx < len(row):
                 new_row = list(row)
-                primary_phone = new_row[col_idx]
+                primary_phone = new_row.pop(col_idx)
                 expanded_row = [primary_phone] + new_row
                 expanded_rows.append(expanded_row)
 
