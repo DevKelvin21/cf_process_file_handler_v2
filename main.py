@@ -57,6 +57,7 @@ def process_file_v2(cloudevent: CloudEvent):
 
     # Process the CSV content
     lines = file_content.splitlines()
+    header = None
     if has_header and lines:
         # Remove the header (or process it as needed)
         header = lines.pop(0)
@@ -126,8 +127,12 @@ def process_file_v2(cloudevent: CloudEvent):
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zfile:
         for name in zfile.namelist():
             file_content_zip = zfile.read(name).decode("utf-8")
-            # Deduplicate lines (naively using a set)
-            deduped = "\n".join(set(file_content_zip.splitlines()))
+            lines = file_content_zip.splitlines()
+            if has_header and header:
+                deduped_lines = set(lines)
+                deduped = "\n".join([header] + list(deduped_lines))
+            else:
+                deduped = "\n".join(set(lines))
             results[name] = deduped
 
     # Write each resulting CSV to an output bucket
