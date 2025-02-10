@@ -183,17 +183,17 @@ def process_file_v2(cloudevent: CloudEvent):
     output_bucket = storage_client.bucket(output_bucket_name)
     output_paths = {}
     for result_filename, content in results.items():
-        output_blob_name = f"{file_id}/{file_name}_{result_filename}"
+        output_blob_name = f"{file_id}/{result_filename}_{file_name}"
         out_blob = output_bucket.blob(output_blob_name)
         out_blob.upload_from_string(content, content_type="text/csv")
-        output_paths[result_filename] = f"{file_id}/{file_name}_{result_filename}"
+        output_paths[result_filename] = f"{file_id}/{result_filename}_{file_name}"
 
     # Update the Firestore document with output file paths and processing status
     config_ref.update({
         "outputFiles": {
-            "cleanFilePath": output_paths.get("all_clean.csv", ""),
-            "invalidFilePath": output_paths.get("invalid.csv", ""),
-            "dncFilePath": output_paths.get("federal_dnc.csv", "")
+            "cleanFilePath": output_paths.get("all_clean", ""),
+            "invalidFilePath": output_paths.get("invalid", ""),
+            "dncFilePath": output_paths.get("federal_dnc", "")
         },
         "status": {
             "stage": "DONE",
