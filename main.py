@@ -211,17 +211,19 @@ def call_blacklist_api(expanded_file_path):
     It sends the CSV file along with the required parameters and returns the path to the ZIP file response.
     """
     blacklist_api_url = "https://api.blacklistalliance.net/bulk/upload"
-    # Read the CSV payload from the file.
-    with open(expanded_file_path, 'r') as f:
+
+    # Read CSV file
+    with open(expanded_file_path, 'r', encoding="utf-8-sig") as f:
         csv_payload = f.read()
 
     file_name = os.path.basename(expanded_file_path)
     file_tuple = (
         file_name,
-        io.BytesIO(csv_payload.encode("utf-8")),
+        io.BytesIO(csv_payload.encode("utf-8-sig")),  # Ensure correct encoding
         "text/csv"
     )
     files = {"file": file_tuple}
+
     payload = {
         "filetype": "csv",
         "download_carrier_data": "false",
@@ -230,18 +232,21 @@ def call_blacklist_api(expanded_file_path):
         "download_wireless": "false",
         "download_federal_dnc": "true",
         "splitchar": ",",
-        "key": os.getenv("BLACKLIST_API_KEY", "YOUR_API_KEY"),
+        "key": os.getenv("BLACKLIST_API_KEY"),
         "colnum": "1"
     }
-    headers = {
-        "accept": "application/zip"
-    }
-    response = requests.post(blacklist_api_url, data=payload, files=files, headers=headers)
-    if response.status_code != 200:
-        print(f"Blacklist API call failed: {response.status_code} - {response.text}")
-        raise Exception("Blacklist API call failed.")
+    headers = {"accept": "application/zip"}
 
-    # Save the ZIP content to a temporary file and return its path.
+    # Send API request
+    response = requests.post(blacklist_api_url, data=payload, files=files, headers=headers)
+
+    # Debug response
+    print(f"API Response Code: {response.status_code}")
+    if response.status_code != 200:
+        print(f"API Error Response: {response.text}")
+        raise Exception(f"Blacklist API call failed: {response.status_code} - {response.text}")
+
+    # Save the ZIP content to a temporary file
     tmp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
     with open(tmp_zip.name, 'wb') as f:
         f.write(response.content)
