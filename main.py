@@ -213,16 +213,16 @@ def call_blacklist_api(expanded_file_path):
     blacklist_api_url = "https://api.blacklistalliance.net/bulk/upload"
 
     # Read CSV file
-    with open(expanded_file_path, 'r', encoding="utf-8-sig") as f:
-        csv_payload = f.read()
+    with open(expanded_file_path, 'rb') as f:  # Read as binary
+        file_content = f.read()
 
     file_name = os.path.basename(expanded_file_path)
-    file_tuple = (
-        file_name,
-        io.BytesIO(csv_payload.encode("utf-8-sig")),  # Ensure correct encoding
-        "text/csv"
-    )
-    files = {"file": file_tuple}
+    if not file_name.endswith(".csv"):
+        file_name += ".csv"  # Ensure the file name has a valid extension
+
+    files = {
+        "file": (file_name, io.BytesIO(file_content), "text/csv")  # Proper formatting
+    }
 
     payload = {
         "filetype": "csv",
@@ -232,7 +232,7 @@ def call_blacklist_api(expanded_file_path):
         "download_wireless": "false",
         "download_federal_dnc": "true",
         "splitchar": ",",
-        "key": os.getenv("BLACKLIST_API_KEY"),
+        "key": os.getenv("BLACKLIST_API_KEY", "YOUR_API_KEY"),
         "colnum": "1"
     }
     headers = {"accept": "application/zip"}
