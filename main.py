@@ -3,44 +3,55 @@ import json
 import io
 import csv
 import base64
-import zipfile
 import tempfile
 import requests
 import functions_framework
 from google.cloud import firestore, storage
 from cloudevents.http import CloudEvent
 
+# Maximum payload size for the API call (1MB).
+MAX_PAYLOAD_SIZE = 1048576  # bytes
+
 
 @functions_framework.cloud_event
 def process_file_v2(cloudevent: CloudEvent):
     """
-    Cloud Function (v2) entry point to process a file based on a Pub/Sub message.
-    Expected Pub/Sub message JSON (in cloudevent.data) should contain:
-      - fileId
-      - fileName
-      - bucket
-      - configDocumentPath  (e.g., "scrubFilesConfig/<docID>")
+    Cloud Function (Gen2) entry point to process a CSV file.
+    Steps:
+      1. Download CSV from Cloud Storage.
+      2. Get config from Firestore to identify phone columns.
+      3. Extract phone numbers and batch them so that each API call payload is below 1MB.
+      4. Call the blacklist API in batches and aggregate the "supression" results.
+      5. If no suppressed numbers are returned, simply store the original file as cleanFilePath.
+      6. Otherwise, process the CSV:
+         - Create a clean file (emptying any suppressed phone numbers).
+         - Create a blacklisted file (only retaining suppressed numbers per lead, merging duplicates).
+      7. Upload generated files to Cloud Storage and update Firestore.
     """
-    # Extract and decode the Pub/Sub message data
-    data = base64.b64decode(cloudevent.data['message']['data']).decode('utf-8')
-    message = json.loads(data)
+    # --- Step 1. Decode the Pub/Sub message ---
+    try:
+        data = base64.b64decode(cloudevent.data['message']['data']).decode('utf-8')
+        message = json.loads(data)
+    except Exception as e:
+        print(f"Error decoding message: {e}")
+        return
 
     file_id = message.get("fileId")
     file_name = message.get("fileName")
     bucket_name = message.get("bucket")
     config_doc_path = message.get("configDocumentPath")
 
-    print(f"fileId: {file_id}, fileName: {file_name}, bucket: {bucket_name}, configDocumentPath: {config_doc_path}")
-
     if not all([file_id, file_name, bucket_name, config_doc_path]):
         print("Missing one or more required fields in the message.")
         return
 
-    # Initialize Firestore and Storage clients
+    print(f"Processing fileId: {file_id}, fileName: {file_name}, bucket: {bucket_name}, config path: {config_doc_path}")
+
+    # --- Step 2. Initialize Firestore and Storage clients ---
     fs_client = firestore.Client()
     storage_client = storage.Client()
 
-    # Fetch configuration from Firestore
+    # Fetch configuration document from Firestore.
     config_ref = fs_client.document(config_doc_path)
     config_snapshot = config_ref.get()
     if not config_snapshot.exists:
@@ -48,206 +59,238 @@ def process_file_v2(cloudevent: CloudEvent):
         return
     config = config_snapshot.to_dict()
 
+    # Retrieve dynamic configuration details.
     phone_indexes = config.get("phoneColumnIndexes", [])
-    has_header = config.get("hasHeaderRow", False)
-    phone_headers = config.get('phoneColumns', [])
+    has_header = config.get("hasHeaderRow", True)
 
-    # Download the file from GCS
+    # --- Step 3. Download and parse the CSV file ---
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(os.path.join('uploads', file_name))
-    file_content = blob.download_as_bytes()
+    try:
+        file_content = blob.download_as_bytes()
+    except Exception as e:
+        print(f"Error downloading file: {e}")
+        return
 
-    # --- Step 3. Read original CSV and determine non-phone columns ---
     decoded_file = file_content.decode('utf-8')
-    reader = csv.reader(decoded_file.splitlines())
-    csv_rows = list(reader)
-    if not csv_rows:
+    csv_lines = decoded_file.splitlines()
+    reader = csv.reader(csv_lines)
+    rows = list(reader)
+    if not rows:
         print("Empty CSV file.")
         return
 
-    original_headers = csv_rows[0]
-    # Identify non-phone column indices
-    non_phone_indices = [i for i in range(len(original_headers)) if i not in phone_indexes]
-    non_phone_headers = [original_headers[i] for i in non_phone_indices]
+    # Separate header from data rows if needed.
+    if has_header:
+        header = rows[0]
+        data_rows = rows[1:]
+    else:
+        header = None
+        data_rows = rows
 
-    # --- Step 4. Expand rows into one row per phone ---
-    # Each expanded row will include a hidden "phone_order" so that we can later restore the order.
-    expanded_rows = []
-    for row in csv_rows[1:]:
-        non_phone_data = [row[i] for i in non_phone_indices]
-        for order, idx in enumerate(phone_indexes):
+    # --- Step 4. Extract unique phone numbers ---
+    phone_set = set()
+    for row in data_rows:
+        for idx in phone_indexes:
             if idx < len(row):
                 phone = row[idx].strip()
                 if phone:
-                    expanded_rows.append({
-                        'phone': phone,
-                        'phone_order': order,
-                        'non_phone_data': non_phone_data
-                    })
+                    phone_set.add(phone)
+    phone_list = list(phone_set)
+    print(f"Extracted {len(phone_list)} unique phone numbers for API lookup.")
 
-    with tempfile.NamedTemporaryFile(mode='w+', delete=False, newline='') as tmp_expanded:
-        writer = csv.writer(tmp_expanded)
-        writer.writerow(['phone', 'phone_order'] + non_phone_headers)
-        for row in expanded_rows:
-            writer.writerow([row['phone'], row['phone_order']] + row['non_phone_data'])
-        expanded_file_path = tmp_expanded.name
+    # --- Step 5. Call the blacklist API in batches ---
+    try:
+        suppressed_list = call_blacklist_lookup_batched(phone_list)
+    except Exception as e:
+        print(f"Error calling blacklist API: {e}")
+        return
 
+    suppressed_set = set(suppressed_list)
+    print(f"Aggregated suppressed numbers: {suppressed_set}")
+
+    # Update Firestore stage.
     config_ref.update({
         "status": {
-            "stage": "PREPARED",
+            "stage": "API_CALLED",
             "lastUpdated": firestore.SERVER_TIMESTAMP
-            }
+        }
     })
-    # --- Step 5. Process the expanded file via the blacklist API ---
-    processed_zip_path = call_blacklist_api(expanded_file_path)
 
-    config_ref.update({
+    # --- Special Case: No suppressed numbers ---
+    if not suppressed_set:
+        print("No suppressed numbers returned. Uploading original file as cleanFilePath.")
+        output_bucket_name = os.getenv("OUTPUT_BUCKET")
+        if not output_bucket_name:
+            print("OUTPUT_BUCKET environment variable is not set.")
+            return
+        output_bucket = storage_client.bucket(output_bucket_name)
+        # Upload the original file content as the clean file.
+        base_name, ext = os.path.splitext(file_name)
+        clean_file_name = f"{base_name}_clean{ext}"
+        clean_blob_name = f"{file_id}/{clean_file_name}"
+        clean_blob = output_bucket.blob(clean_blob_name)
+        clean_blob.upload_from_string(decoded_file, content_type="text/csv")
+
+        # Update Firestore with output path.
+        config_ref.update({
+            "outputFiles": {
+                "cleanFilePath": clean_blob_name,
+                "blacklistedFilePath": ""  # No blacklisted file produced.
+            },
             "status": {
-                "stage": "API_CALLED",
+                "stage": "DONE",
                 "lastUpdated": firestore.SERVER_TIMESTAMP
-                }
+            }
         })
-    # --- Step 6. Decompress the ZIP and build results + prepare for merging ---
-    # We'll accumulate each CSV file's raw content (to be uploaded individually)
-    # and also collect the rows (with their file base) for merging.
-    results = {}           # key: result_filename, value: CSV content as string
-    processed_rows_all = []  # list of tuples: (file_base, row)
-    file_names_set = set()
+        print(f"Processed file_id={file_id}. Clean file uploaded to: {clean_blob_name}")
+        return
 
-    with zipfile.ZipFile(processed_zip_path, 'r') as zip_ref:
-        for csv_filename in zip_ref.namelist():
-            if csv_filename.endswith('.csv'):
-                file_base = os.path.splitext(os.path.basename(csv_filename))[0]
-                file_names_set.add(file_base)
-                # Read entire file content as string and store in results
-                raw_bytes = zip_ref.read(csv_filename)
-                csv_content = raw_bytes.decode('utf-8')
-                results[file_base] = csv_content
+    # --- Step 6. Process CSV rows for clean and blacklisted outputs ---
+    clean_rows = []
+    suppressed_dict = {}  # Group suppressed rows by lead_id (assumed to be in column 0)
 
-                # Also, parse rows for merging.
-                with zip_ref.open(csv_filename) as csvfile:
-                    reader = csv.reader(io.TextIOWrapper(csvfile, 'utf-8'))
-                    try:
-                        next(reader)  # Skip header
-                    except StopIteration:
-                        continue
-                    for row in reader:
-                        # Attach the file_base to each row for later grouping.
-                        processed_rows_all.append((file_base, row))
+    # Add header if present.
+    if header:
+        clean_rows.append(header)
+        suppressed_header = header[:]  # Copy for suppressed file
+    else:
+        suppressed_header = None
 
-    
-    # --- Step 7. Merge processed rows to re-create the original lead rows ---
-    # Group rows by non-phone data. For each group, for each file (ordered),
-    # we place the phone numbers in the order indicated by phone_order.
-    merge_dict = {}  # key: non_phone_data tuple, value: dict mapping file_base -> list of phones
-    for file_base, row in processed_rows_all:
-        phone = row[0].strip()
-        try:
-            phone_order = int(row[1])
-        except ValueError:
-            continue
-        non_phone_data = tuple(row[2:])
-        if non_phone_data not in merge_dict:
-            merge_dict[non_phone_data] = {}
-        if file_base not in merge_dict[non_phone_data]:
-            merge_dict[non_phone_data][file_base] = ["" for _ in range(len(phone_headers))]
-        merge_dict[non_phone_data][file_base][phone_order] = phone
+    for row in data_rows:
+        clean_row = list(row)       # For clean file: clear suppressed phones.
+        suppressed_row = list(row)  # For blacklisted file: retain only suppressed phones.
+        row_has_suppressed = False
 
-    ordered_files = sorted(list(file_names_set))
-    merged_rows = []
-    for non_phone_data, file_data in merge_dict.items():
-        merged_row = list(non_phone_data)
-        for file_base in ordered_files:
-            phones = file_data.get(file_base, ["" for _ in range(len(phone_headers))])
-            merged_row.extend(phones)
-        merged_rows.append(merged_row)
+        for idx in phone_indexes:
+            if idx < len(row):
+                phone_val = row[idx].strip()
+                if phone_val in suppressed_set:
+                    # For clean file, empty the cell.
+                    clean_row[idx] = ""
+                    # For suppressed file, keep the suppressed number.
+                    suppressed_row[idx] = phone_val
+                    row_has_suppressed = True
+                else:
+                    # Clear non-suppressed phone cells in the suppressed file.
+                    suppressed_row[idx] = ""
+        clean_rows.append(clean_row)
 
-    # Build final merged CSV content as a string.
-    final_header = non_phone_headers[:]
-    for file_base in ordered_files:
-        for header in phone_headers:
-            final_header.append(f"{file_base}_{header}")
-    merged_output = io.StringIO()
-    writer = csv.writer(merged_output)
-    writer.writerow(final_header)
-    for row in merged_rows:
-        writer.writerow(row)
-    merged_csv_content = merged_output.getvalue()
-    results["merged"] = merged_csv_content
+        # Group rows with suppressed numbers by lead_id.
+        if row_has_suppressed:
+            lead_id = row[0] if len(row) > 0 else None
+            if lead_id in suppressed_dict:
+                existing_row = suppressed_dict[lead_id]
+                for idx in phone_indexes:
+                    # Merge suppressed phone numbers for the same lead.
+                    if idx < len(row) and not existing_row[idx] and suppressed_row[idx]:
+                        existing_row[idx] = suppressed_row[idx]
+                suppressed_dict[lead_id] = existing_row
+            else:
+                suppressed_dict[lead_id] = suppressed_row
 
-    # --- Step 8. Upload each resulting CSV file to the output bucket ---
+    # Build suppressed file rows.
+    suppressed_rows = []
+    if suppressed_header:
+        suppressed_rows.append(suppressed_header)
+    suppressed_rows.extend(suppressed_dict.values())
+
+    # --- Step 7. Write the output CSV files in memory ---
+    clean_csv_output = io.StringIO()
+    writer_clean = csv.writer(clean_csv_output)
+    for row in clean_rows:
+        writer_clean.writerow(row)
+    clean_csv_content = clean_csv_output.getvalue()
+
+    suppressed_csv_output = io.StringIO()
+    writer_suppressed = csv.writer(suppressed_csv_output)
+    if suppressed_header:
+        writer_suppressed.writerow(suppressed_header)
+    for row in (list(suppressed_dict.values()) if not suppressed_header else suppressed_rows[1:]):
+        writer_suppressed.writerow(row)
+    suppressed_csv_content = suppressed_csv_output.getvalue()
+
+    # --- Step 8. Upload generated files to Cloud Storage ---
     output_bucket_name = os.getenv("OUTPUT_BUCKET")
     if not output_bucket_name:
         print("OUTPUT_BUCKET environment variable is not set.")
         return
     output_bucket = storage_client.bucket(output_bucket_name)
-    output_paths = {}
-    for result_filename, content in results.items():
-        output_blob_name = f"{file_id}/{result_filename}_{file_name}"
-        out_blob = output_bucket.blob(output_blob_name)
-        out_blob.upload_from_string(content, content_type="text/csv")
-        output_paths[result_filename] = f"{file_id}/{result_filename}_{file_name}"
 
-    # Update the Firestore document with output file paths and processing status
+    base_name, ext = os.path.splitext(file_name)
+    clean_file_name = f"{base_name}_clean{ext}"
+    suppressed_file_name = f"{base_name}_blacklisted{ext}"
+
+    clean_blob_name = f"{file_id}/{clean_file_name}"
+    suppressed_blob_name = f"{file_id}/{suppressed_file_name}"
+
+    clean_blob = output_bucket.blob(clean_blob_name)
+    suppressed_blob = output_bucket.blob(suppressed_blob_name)
+
+    clean_blob.upload_from_string(clean_csv_content, content_type="text/csv")
+    suppressed_blob.upload_from_string(suppressed_csv_content, content_type="text/csv")
+
+    output_paths = {
+        "cleanFilePath": clean_blob_name,
+        "blacklistedFilePath": suppressed_blob_name
+    }
+
+    # --- Step 9. Update Firestore with output file paths and final status ---
     config_ref.update({
-        "outputFiles": {
-            "cleanFilePath": output_paths.get("all_clean", ""),
-            "invalidFilePath": output_paths.get("invalid", ""),
-            "dncFilePath": output_paths.get("federal_dnc", "")
-        },
+        "outputFiles": output_paths,
         "status": {
             "stage": "DONE",
             "lastUpdated": firestore.SERVER_TIMESTAMP
-            }
+        }
     })
-    # Clean up temporary files.
-    os.remove(expanded_file_path)
-    os.remove(processed_zip_path)
-    print(f"Processed file_id={file_id}. Output files uploaded: {output_paths}")
 
-def call_blacklist_api(expanded_file_path):
+    print(f"Processed file_id={file_id}. Clean file uploaded to: {clean_blob_name}")
+    print(f"Processed file_id={file_id}. Blacklisted file uploaded to: {suppressed_blob_name}")
+
+def call_blacklist_lookup_batched(phone_list):
     """
-    Calls the external blacklist API with the expanded CSV file.
-    It sends the CSV file along with the required parameters and returns the path to the ZIP file response.
+    Breaks the phone_list into batches such that each JSON payload ({"phones": batch})
+    is less than MAX_PAYLOAD_SIZE (1MB). It then calls the API for each batch and
+    aggregates the suppressed numbers.
     """
-    blacklist_api_url = "https://api.blacklistalliance.net/bulk/upload"
+    batches = []
+    current_batch = []
+    for phone in phone_list:
+        current_batch.append(phone)
+        payload = {"phones": current_batch}
+        payload_str = json.dumps(payload)
+        # Check size in bytes; if over the limit, remove the last phone and finalize the batch.
+        if len(payload_str.encode('utf-8')) > MAX_PAYLOAD_SIZE:
+            current_batch.pop()
+            if current_batch:
+                batches.append(current_batch)
+            current_batch = [phone]
+    if current_batch:
+        batches.append(current_batch)
 
-    # Read CSV file
-    with open(expanded_file_path, 'rb') as f:  # Read as binary
-        file_content = f.read()
+    suppressed = set()
+    for batch in batches:
+        suppressed_batch = call_blacklist_lookup(batch)
+        suppressed.update(suppressed_batch)
+    return list(suppressed)
 
-    file_name = os.path.basename(expanded_file_path)
-    if not file_name.endswith(".csv"):
-        file_name += ".csv"  # Ensure the file name has a valid extension
-
-    files = {
-        "file": (file_name, io.BytesIO(file_content), "text/csv")  # Proper formatting
+def call_blacklist_lookup(phone_batch):
+    """
+    Calls the external blacklist lookup API with a JSON payload containing the given phone_batch.
+    API URL example:
+      https://api.blacklistalliance.net/bulklookup?key=HxWQvKK2g8MyDz7XFGZN&ver=v1&resp=json
+    Returns the list of suppressed phone numbers from the "supression" key.
+    """
+    api_key = os.getenv("BLACKLIST_API_KEY")
+    api_url = f"https://api.blacklistalliance.net/bulklookup?key={api_key}&ver=v1&resp=json"
+    payload = {"phones": phone_batch}
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json"
     }
-
-    payload = {
-        "filetype": "csv",
-        "download_carrier_data": "false",
-        "download_invalid": "true",
-        "download_no_carrier": "false",
-        "download_wireless": "false",
-        "download_federal_dnc": "true",
-        "splitchar": ",",
-        "key": os.getenv("BLACKLIST_API_KEY", "YOUR_API_KEY"),
-        "colnum": "1"
-    }
-    headers = {"accept": "application/zip"}
-
-    # Send API request
-    response = requests.post(blacklist_api_url, data=payload, files=files, headers=headers)
-
-    # Debug response
-    print(f"API Response Code: {response.status_code}")
+    response = requests.post(api_url, json=payload, headers=headers)
     if response.status_code != 200:
-        print(f"API Error Response: {response.text}")
         raise Exception(f"Blacklist API call failed: {response.status_code} - {response.text}")
-
-    # Save the ZIP content to a temporary file
-    tmp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
-    with open(tmp_zip.name, 'wb') as f:
-        f.write(response.content)
-    return tmp_zip.name
+    response_json = response.json()
+    # Retrieve suppressed numbers from the API response.
+    return response_json.get("supression", [])
