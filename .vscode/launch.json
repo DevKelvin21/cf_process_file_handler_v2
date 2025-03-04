@@ -1,0 +1,23 @@
+{
+    "version": "0.1.0",
+    "configurations": [
+      {
+        "name": "Debug Cloud Function Locally",
+        "type": "debugpy",
+        "request": "launch",
+        "program": "${workspaceFolder}/main.py",
+        "args": [
+          "functions_framework",
+          "--target=process_file_v2",
+          "--port=8090"
+        ],
+        "env": {
+          "PORT": "",
+          "BLACKLIST_API_KEY": "",
+          "OUTPUT_BUCKET": ""
+        },
+        "console": "integratedTerminal"
+      }
+    ]
+  }
+  

@@ -134,6 +134,11 @@ def process_file_v2(cloudevent: CloudEvent):
 
         # Update Firestore with output path.
         config_ref.update({
+            "results" : {
+                "total": len(phone_list),
+                "clean": len(phone_list),
+                "dnc": 0
+            },
             "outputFiles": {
                 "cleanFilePath": clean_blob_name,
                 "blacklistedFilePath": ""  # No blacklisted file produced.
@@ -237,6 +242,11 @@ def process_file_v2(cloudevent: CloudEvent):
 
     # --- Step 9. Update Firestore with output file paths and final status ---
     config_ref.update({
+        "results": {
+            "total": len(phone_list),
+            "clean": len(phone_list) - len(suppressed_set),
+            "dnc": len(suppressed_set)
+        },
         "outputFiles": output_paths,
         "status": {
             "stage": "DONE",
